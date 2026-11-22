@@ -381,33 +381,86 @@ class Writer:
 # Colour analysis
 # =========================================================================== #
 
-def materials(img_nolines, fg, k, rng):
-    """Cluster the piece into 'materials' (hair, jacket, skin...) by hue rather
-    than shade, so each gets a single base colour like a real flat."""
+def materials(img_nolines, fg, lines, k, rng):
+    """Work out flat base colours the way you'd lay them down: one colour per
+    shape enclosed by the line art (ignoring the shading inside it), then group
+    shapes of the same material (hair, jacket, skin...) onto one shared colour."""
+    from scipy import ndimage
+    h, w = fg.shape
+    walls = cv2.dilate(lines, np.ones((3, 3), np.uint8), iterations=2) > 0
+    # The edge of the figure counts as a wall too, so gaps in the line art
+    # can't leak a shape into the background.
+    walls |= ~fg
+    n, reg = cv2.connectedComponents((~walls).astype(np.uint8), connectivity=4)
+    # Pixels under the lines take the label of the nearest region.
+    _, (iy, ix) = ndimage.distance_transform_edt(walls, return_indices=True)
+    reg = reg[iy, ix]
     lab = cv2.cvtColor(img_nolines, cv2.COLOR_BGR2LAB).astype(np.float32)
-    feat = np.stack([lab[:, :, 1], lab[:, :, 2], lab[:, :, 0] * 0.35], 2)
-    pts = feat[fg]
-    sample = pts[rng.choice(len(pts), min(len(pts), 60000), replace=False)]
-    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
-    _, _, centres = cv2.kmeans(sample, k, None, crit, 4, cv2.KMEANS_PP_CENTERS)
-    idx = np.empty(len(pts), np.uint8)
-    for s in range(0, len(pts), 200000):
-        d = ((pts[s:s + 200000, None, :] - centres[None]) ** 2).sum(2)
-        idx[s:s + 200000] = d.argmin(1)
-    mat = np.full(fg.shape, 255, np.uint8)
-    mat[fg] = idx
-    mat = cv2.medianBlur(mat, 7)
+    L = lab[:, :, 0]
+    # A shape with two clearly different colours (e.g. skin and socks with no
+    # line between them) is split, but shading within one colour is not.
+    nxt = n
+    for r in range(1, n):
+        m = (reg == r) & fg
+        cnt = int(m.sum())
+        if cnt < 400:
+            continue
+        ys_, xs_ = np.nonzero(m)
+        v = lab[ys_, xs_]
+        smp = v[rng.choice(len(v), min(len(v), 4000), replace=False)]
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+        _, lb, cen = cv2.kmeans(smp, 2, None, crit, 2, cv2.KMEANS_PP_CENTERS)
+        frac = lb.mean()
+        if np.linalg.norm(cen[0] - cen[1]) < 48 or min(frac, 1 - frac) < 0.12:
+            continue
+        side = ((v - cen[1]) ** 2).sum(1) < ((v - cen[0]) ** 2).sum(1)
+        y0, x0 = ys_.min(), xs_.min()
+        patch = np.zeros((ys_.max() - y0 + 1, xs_.max() - x0 + 1), np.uint8)
+        patch[ys_ - y0, xs_ - x0] = np.where(side, 2, 1)
+        patch = cv2.medianBlur(patch, 7)
+        sel = patch[ys_ - y0, xs_ - x0] == 2
+        reg[ys_[sel], xs_[sel]] = nxt
+        nxt += 1
+    n = nxt
+    fgf = fg.ravel()
+    flat_reg = reg.ravel()[fgf]          # only figure pixels decide a region's colour
+    pix = img_nolines.reshape(-1, 3)[fgf]
+    Lf = L.ravel()[fgf]
+    counts = np.bincount(flat_reg, minlength=n)
+    order = np.argsort(flat_reg, kind="stable")
+    bounds = np.r_[0, np.cumsum(counts)]
+    reg_col = np.zeros((n, 3), np.float32)
+    is_fg = np.zeros(n, bool)
+    for r in range(1, n):
+        if counts[r] < 4:
+            continue
+        idx = order[bounds[r]:bounds[r + 1]]
+        lv = Lf[idx]
+        lo, hi = np.percentile(lv, 55), np.percentile(lv, 85)  # lit side, not the shadows
+        sel = idx[(lv >= lo) & (lv <= hi)]
+        reg_col[r] = np.median(pix[sel if len(sel) else idx], axis=0)
+        is_fg[r] = True
+    # Group regions into materials by their lit colour (area weighted).
+    ids = np.nonzero(is_fg)[0]
+    cols_lab = cv2.cvtColor(reg_col[ids][None].astype(np.uint8), cv2.COLOR_BGR2LAB)[0].astype(np.float32)
+    k = min(k, len(ids))
+    reps = np.repeat(cols_lab, np.clip(counts[ids] // 200 + 1, 1, 400), axis=0)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.2)
+    _, _, centres = cv2.kmeans(reps, k, None, crit, 6, cv2.KMEANS_PP_CENTERS)
+    assign = ((cols_lab[:, None] - centres[None]) ** 2).sum(2).argmin(1)
+    reg_mat = np.full(n, 255, np.uint8)
+    reg_mat[ids] = assign
+    mat = reg_mat[reg]
     mat[~fg] = 255
     base = np.zeros((k, 3), np.uint8)
-    L = lab[:, :, 0]
     for c in range(k):
-        m = mat == c
-        if m.sum() < 20:
-            continue
-        lv = L[m]
-        lo, hi = np.percentile(lv, 60), np.percentile(lv, 85)  # lit side, ignoring shadows
-        sel = m & (L >= lo) & (L <= hi)
-        base[c] = np.median(img_nolines[sel if sel.any() else m], axis=0)
+        m = ids[assign == c]
+        wts = counts[m].astype(np.float64)
+        # weighted median per channel
+        for ch in range(3):
+            o = np.argsort(reg_col[m, ch])
+            cw = np.cumsum(wts[o])
+            base[c, ch] = reg_col[m, ch][o][np.searchsorted(cw, cw[-1] / 2)]
     return mat, base
 
 
@@ -472,7 +525,7 @@ def main():
     no_lines = cv2.inpaint(img, cv2.dilate(lines, np.ones((3, 3), np.uint8)), 3, cv2.INPAINT_TELEA)
     fg = np.abs(no_lines.astype(np.int16) - 255).sum(2) > 30
     fg = cv2.morphologyEx(fg.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
-    mat_idx, base_cols = materials(no_lines, fg, args.materials, rng)
+    mat_idx, base_cols = materials(no_lines, fg, lines, args.materials, rng)
     flats = paper.copy()
     for c in range(len(base_cols)):
         flats[mat_idx == c] = base_cols[c]
@@ -532,12 +585,14 @@ def main():
             seg = resample(np.array([poly[i], poly[(i + 1) % len(poly)]]), 1.5)
             if len(seg) > 6:
                 c_paths.append(overshoot(jitter(seg, 2 * sc, rng), rng, 4 * sc, 14 * sc))
+    blobs = []
     for c in range(len(base_cols)):
         n, lab, stats, _ = cv2.connectedComponentsWithStats((mat_idx == c).astype(np.uint8))
-        for j in range(1, n):
-            if stats[j, cv2.CC_STAT_AREA] < 0.006 * w * h:
-                continue
-            cc, _ = cv2.findContours((lab == j).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        blobs += [(stats[j, cv2.CC_STAT_AREA], lab == j) for j in range(1, n)
+                  if stats[j, cv2.CC_STAT_AREA] >= 0.012 * w * h]
+    for _, blob in sorted(blobs, key=lambda b: -b[0])[:6]:  # just the main masses
+        if True:
+            cc, _ = cv2.findContours(blob.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             big = max(cc, key=len)
             if len(big) < 5:
                 continue
